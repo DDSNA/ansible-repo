@@ -1,0 +1,6 @@
+- name: Deploy Flannel network on Kubernetes
+  hosts: master
+  become: true
+  tasks:
+    - name: Apply Flannel network plugin
+      command: kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml

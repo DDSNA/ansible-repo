@@ -1,0 +1,27 @@
+- name: Install Docker on all nodes
+  hosts: all
+  become: true
+  tasks:
+    
+    - name: Update apt and install prerequisites
+      apt:
+        update_cache: true
+
+    - name: Install Docker dependencies
+      apt:
+        name: ['apt-transport-https', 'ca-certificates', 'curl', 'gnupg', 'lsb-release']
+        state: present
+
+    - name: Install keyrings
+      shell: curl -fsSL https://get.docker.com -o get-docker.sh
+
+    - name: Installation of Docker
+      shell: sudo sh ./get-docker.sh
+
+    - name: Update apt cache again
+      apt:
+          update_cache: true
+    - name: Install docker-ce
+      apt:
+        name: ['docker-ce', 'docker-ce-cli', 'containerd.io', 'docker-buildx-plugin', 'docker-compose-plugin']
+        state: present
