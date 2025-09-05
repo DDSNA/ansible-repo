@@ -1,0 +1,160 @@
+- name: Install Docker on all nodes
+  hosts: all
+  become: true
+  tasks:
+    - name: Update apt and install prerequisites
+      apt:
+        update_cache: true
+
+    - name: Install Docker dependencies
+      apt:
+        name: ['apt-transport-https', 'ca-certificates', 'curl', 'gnupg', 'lsb-release']
+        state: present
+
+    - name: Install keyrings
+      shell: curl -fsSL https://get.docker.com -o get-docker.sh
+
+    - name: Installation of Docker
+      shell: sudo sh ./get-docker.sh
+
+    - name: Update apt cache again
+      apt:
+          update_cache: true
+    - name: Install docker-ce
+      apt:
+        name: ['docker-ce', 'docker-ce-cli', 'containerd.io', 'docker-buildx-plugin', 'docker-compose-plugin']
+        state: present
+
+- name: Install ipmitool on all nodes
+  hosts: all
+  become: true
+  tasks:
+    - name: Update apt and install prerequisites
+      apt:
+        update_cache: true
+
+    - name: Install ipmitool
+      apt:
+        name: ipmitool
+        state: present
+
+    - name: Generate shell script for remote server management - ON
+      copy:
+        dest: /home/pi/server_control/server_turn_on.sh
+        content: |
+          #!/bin/bash
+
+          # Dell Server Fan Control Script
+          # Server: ${SERVER_IP}
+          # User: ${SERVER_USER}
+          # ${SERVER_PASSWORD}word: ${SERVER_PASSWORD}
+
+          # Step 1: Enable manual fan control mode
+
+          echo "Enabling manual fan control mode..."
+          sudo ipmitool -I lanplus -H ${SERVER_IP} -U ${SERVER_USER} -P ${SERVER_PASSWORD} raw 0x30 0x30 0x01 0x00
+
+          # Step 2: Set fan speed to 15% (hex value: 0x0F for 15%)
+          echo "Setting fan speed to 15%..."
+          sudo ipmitool -I lanplus -H ${SERVER_IP} -U ${SERVER_USER} -P ${SERVER_PASSWORD} raw 0x30 0x30 0x02 0xff 0x0f
+
+          echo "Turning on server"
+          sudo ipmitool -I lanplus -H ${SERVER_IP} -U ${SERVER_USER} -P ${SERVER_PASSWORD} power on
+
+          # Step 3: Verify current fan speeds
+          echo "Current fan speeds:"
+          sleep 5
+          sudo ipmitool -I lanplus -H ${SERVER_IP} -U ${SERVER_USER} -P ${SERVER_PASSWORD} sensor list | grep -i fan
+
+          # Alternative: Check all thermal sensors
+          echo -e "\nThermal sensors:"
+          sleep 5
+          sudo ipmitool -I lanplus -H ${SERVER_IP} -U ${SERVER_USER} -P ${SERVER_PASSWORD} sensor list | grep -i temp
+      mode: '0755'
+      
+    - name: Generate shell script for remote server management - OFF
+      copy:
+        dest: /home/pi/server_control/server_turn_off.sh
+        content: |
+          echo "Turning off server"
+          sudo ipmitool -I lanplus -H ${SERVER_IP} -U  ${SERVER_USER} -P ${SERVER_PASSWORD} power soft
+
+          sleep 180
+          echo "2nd call to turn server off"
+          sudo ipmitool -I lanplus -H ${SERVER_IP} -U  ${SERVER_USER} -P ${SERVER_PASSWORD} power soft
+      mode: '0755'
+
+- name: Install openshift-clients on all nodes
+  hosts: all
+  become: true
+  tasks:
+    - name: Update apt and install prerequisites
+      apt:
+        update_cache: true
+
+    - name: Install openshift-clients
+      apt:
+        name: openshift-clients
+        state: present
+
+- name: Clone airflow and spark git repos
+  hosts: all
+  become: true
+  tasks:
+    - name: Ensure git is installed
+      apt:
+        name: git
+        state: present
+
+    - name: Clone airflow repo
+      git:
+        # DDSNA/raspberry-pi-quickfiles
+        repo: 'DDSNA/raspberry-pi-quickfiles'
+        dest: /home/pi/raspberry-pi-quickfiles
+        version: main
+
+    - name: Build Docker image for airflow
+      command: docker build -t raspberry-pi-airflow:latest /home/pi/raspberry-pi-quickfiles/airflow
+    
+# Experimenting with a new approach to setting up passwordless SSH between nodes
+- name: Generate SSH keys for user pi
+  hosts: all
+  become: true
+  tasks:
+    - name: Ensure .ssh directory exists
+      folder: .ssh
+    - name: Generate SSH key pair
+      openssh_keypair: entype=ed25519 path=/home/pi/.ssh/id_rsa force=yes
+    - name: Set permissions on private key
+      file: path=/home/pi/.ssh/id_rsa mode=0600
+    - name: Set permissions on public key
+      file: path=/home/pi/.ssh/id_rsa.pub mode=0644
+    - name: Add public key to authorized_keys
+      authorized_key:
+        user: pi
+        state: present
+        key: "{{ lookup('file', '/home/pi/.ssh/id_rsa.pub') }}"
+
+- name: Add other nodes to known_hosts for user pi
+  hosts: all
+  become: true
+  tasks:
+    - name: Add other nodes to known_hosts
+      known_hosts: name={{ item }} key="{{ lookup('pipe', 'ssh-keyscan -H ' + item) }}" state=present
+      loop: "{{ groups['all'] }}"
+      when: item != inventory_hostname
+      become_user: pi
+
+- name: Test SSH connectivity between nodes
+  hosts: all
+  become: true
+  tasks:
+    - name: Test SSH connectivity to other nodes
+      command: ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5 {{ item }} echo "SSH to {{ item }} successful"
+      register: ssh_test
+      ignore_errors: yes
+      loop: "{{ groups['all'] }}"
+      when: item != inventory_hostname
+      become_user: pi
+    - name: Display SSH test results
+      debug: var=ssh_test.results

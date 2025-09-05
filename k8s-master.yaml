@@ -1,0 +1,74 @@
+# TODO: Configure either containerd or docker as the container runtime
+# TODO: containerd sudo containerd config default | sudo tee /etc/containerd/config.toml > /dev/null && sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+# TODO: docker setup equivalent to containerd steps WARN I found out this was in fact deprecated! :o
+# DEBIAN MACHINES ONLY! NO UBUNTU!
+- name: Set up Kubernetes control-plane
+  hosts: master
+  become: true
+
+  tasks:
+    - name: Get Kubernetes join command
+      shell: kubeadm token create --print-join-command
+      register: kubeadm_join_cmd
+
+    - name: Add Kubernetes apt-key
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: "0644"
+        force: true
+
+    - name: Install APT Transport HTTPS
+      apt:
+        name: apt-transport-https
+        state: present
+
+    - name: Add Kubernetes APT repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /"
+        state: present
+        update_cache: yes
+
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install containerd
+      apt:
+        name: containerd.io
+        state: latest
+        update_cache: yes
+
+    - name: Config containerd part 1
+      shell: sudo containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+    
+    - name: Config containerd part 2
+      shell: sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+    
+    - name: Restart containerd
+      service:
+        name: containerd
+        state: restarted
+
+    - name: Install kubeadm, kubelet, and kubectl with latest versions
+      apt:
+        name: ['kubeadm', 'kubelet', 'kubectl']
+        state: latest
+        update_cache: yes
+
+    - name: Set permissions to kube config for master user
+      shell: sudo chmod 644 /etc/kubernetes/admin.conf
+
+    - name: Initialize Kubernetes cluster
+      command: kubeadm init --pod-network-cidr=10.244.0.0/16
+      register: kubeadm_output
+
+    - name: Set ownership over administrative config of Kubernetes
+      shell: sudo chmod 644 /etc/kubernetes/admin.conf
+
+    - name: Export kubeconfig location as variable
+      shell: export KUBECONFIG=/etc/kubernetes/admin.conf
+    - name: Save the kubeadm join command for worker nodes
+      set_fact:
+        kubeadm_join_cmd: "{{ kubeadm_output.stdout_lines | select('search', 'kubeadm join') | list }}"

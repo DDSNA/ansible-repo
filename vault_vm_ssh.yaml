@@ -1,0 +1,81 @@
+# requires debians in hosts.ini
+# requires vault_token, vault_addr ins vault-ansible global_vars/debians.yml
+- name: Retrieve SSH keys from HashiCorp Vault
+  hosts: debians
+  collections:
+    - community.hashi_vault
+    - community.crypto
+  tasks:
+    - name: Generate ephemeral Ed25519 SSH key pair
+      community.crypto.openssh_keypair:
+        path: /tmp/ansible_temp_key
+        type: ed25519
+      delegate_to: localhost
+
+    - name: Read generated public key
+      set_fact:
+        temp_public_key: "{{ lookup('file', '/tmp/ansible_temp_key.pub') }}"
+      delegate_to: localhost
+
+    - name: Get SSH certificate from Vault
+      uri:
+        url: "{{ vault_addr }}/v1/ssh-client-signer/sign/administrator"
+        method: POST
+        headers:
+          X-Vault-Token: "{{ vault_token }}"
+        body_format: json
+        body:
+          public_key: "{{ temp_public_key }}"
+          valid_principals: "ladministrator"
+          ttl: "30m"
+          key_type: "ed25519"  # Specify the key type
+        return_content: yes
+      register: ssh_cert_response
+      delegate_to: localhost
+
+    - name: Write certificate to file
+      copy:
+        content: "{{ ssh_cert_response.json.data.signed_key }}"
+        dest: /tmp/ansible_temp_key-cert.pub
+      delegate_to: localhost
+
+    - name: Use certificate for SSH connection
+      set_fact:
+        ansible_ssh_private_key_file: /tmp/ansible_temp_key
+        ansible_ssh_certificate_file: /tmp/ansible_temp_key-cert.pub
+        
+- name: Test SSH certificate connection
+  hosts: debians
+  tasks:
+    - name: Test connection with uptime command
+      command: uptime
+      register: uptime_result
+      
+    - name: Display uptime output
+      debug:
+        msg: "{{ inventory_hostname }}: {{ uptime_result.stdout }}"
+
+- name: Update apt cache
+  hosts: debians
+  become: true
+  tasks:
+    - name: Update caches
+      ansible.builtin.apt:
+        update_cache: true
+      cache_valid_time: 3600  # Cache is valid for 1 hour
+      when: ansible_distribution == "Debian" or ansible_distribution == "Ubuntu" 
+      register: apt_update_result
+
+    - name: Display cache update results
+      debug:
+        msg: "Cache updated on {{ inventory_hostname }}: {{ 'Updated' if apt_update_result.changed else 'Already current' }}"
+
+    - name: Check for available upgrades
+      ansible.builtin.apt:
+        update_cache: true
+      register: upgradable_packages
+
+    - name: Show upgrade summary
+      debug:
+        msg: "{{ inventory_hostname }}: {{ upgradable_packages.results | length }} packages can be upgraded"
+      when: upgradable_packages.results is defined
