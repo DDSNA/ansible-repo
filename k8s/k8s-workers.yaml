@@ -1,68 +1,143 @@
-- name: Set up Kubernetes control-plane
+---
+- name: Initialize Kubernetes Master
   hosts: master
   become: true
   tasks:
-    - name: Install containerd
-      apt:
-        name: 'containerd.io'
-        state: latest
-        update_cache: yes
-      
-    - name: Config containerd part 1
-      shell: sudo containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+    - name: Check if cluster is initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_init
     
-    - name: Config containerd part 2
-      shell: sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+    - name: Initialize Kubernetes cluster
+      command: >
+        kubeadm init
+        --pod-network-cidr=10.244.0.0/16
+        --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+      when: not k8s_init.stat.exists
+      register: kubeadm_init
     
-    - name: Restart containerd
-      service:
-        name: containerd
-        state: restarted
-
-    - name: Get Kubernetes join command
-      shell: kubeadm token create --print-join-command
-      register: kubeadm_join_cmd
-
-    - name: Set join command as a fact
+    - name: Create .kube directory
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+      when: not k8s_init.stat.exists
+    
+    - name: Copy admin.conf to user kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+        remote_src: yes
+      when: not k8s_init.stat.exists
+    
+    - name: Wait for Kubernetes API server to be ready
+      command: kubectl get nodes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: kubectl_result
+      until: kubectl_result.rc == 0
+      retries: 10
+      delay: 10
+      changed_when: false
+    
+    - name: Install CNI (Flannel)
+      command: kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: not k8s_init.stat.exists
+    
+    - name: Generate join command
+      command: kubeadm token create --print-join-command --kubeconfig /etc/kubernetes/admin.conf
+      changed_when: false
+      register: join_command
+    
+    - name: Set join command fact
       set_fact:
-        kubeadm_join_cmd: "{{ kubeadm_join_cmd.stdout }}"
+        kubeadm_join_cmd: "{{ join_command.stdout }}"
 
-
-- name: Configure worker nodes to join Kubernetes cluster
+- name: Join Worker Nodes
   hosts: kube_node
   become: true
   tasks:
-    - name: Add Kubernetes apt-key
-      get_url:
-        url: https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key
-        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
-        mode: "0644"
-        force: true
-
-    - name: Install APT Transport HTTPS
-      apt:
-        name: apt-transport-https
-        state: present
-
-    - name: Add Kubernetes APT repository
-      apt_repository:
-        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /"
-        state: present
-        update_cache: yes
-
-    - name: Update package cache
-      apt:
-        update_cache: yes
-        cache_valid_time: 3600
-
-    - name: Install kubeadm and kubelet
-      apt:
-        name: ['kubeadm', 'kubelet']
-        state: present
-
-    - name: Debug hostvars for master
+    - name: Check if any Kubernetes files exist
+      stat:
+        path: "{{ item }}"
+      register: k8s_files
+      loop:
+        - /etc/kubernetes/kubelet.conf
+        - /etc/kubernetes/pki/ca.crt
+        - /etc/kubernetes/manifests
+    
+    - name: Set fact if cleanup is needed
+      set_fact:
+        needs_cleanup: "{{ k8s_files.results | selectattr('stat.exists', 'equalto', true) | list | length > 0 }}"
+    
+    - name: Check if node exists in cluster
+      command: kubectl get node {{ ansible_hostname }} --kubeconfig /etc/kubernetes/admin.conf
+      delegate_to: "{{ groups['master'][0] }}"
+      register: node_exists
+      failed_when: false
+      changed_when: false
+      when: needs_cleanup | bool
+    
+    - name: Delete node from cluster if it exists
+      command: kubectl delete node {{ ansible_hostname }} --kubeconfig /etc/kubernetes/admin.conf
+      delegate_to: "{{ groups['master'][0] }}"
+      when: 
+        - needs_cleanup | bool
+        - node_exists.rc == 0
+      changed_when: true
+    
+    - name: Stop kubelet service
+      systemd:
+        name: kubelet
+        state: stopped
+      failed_when: false
+      when: needs_cleanup | bool
+    
+    - name: Reset kubeadm completely
+      command: kubeadm reset -f
+      when: needs_cleanup | bool
+    
+    - name: Remove all Kubernetes directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/cni/net.d
+        - /etc/kubernetes
+        - /var/lib/kubelet
+        - /var/lib/etcd
+        - /opt/cni/bin
+      when: needs_cleanup | bool
+    
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+      when: needs_cleanup | bool
+    
+    - name: Wait for containerd to be ready
+      wait_for:
+        timeout: 5
+      when: needs_cleanup | bool
+    
+    - name: Join cluster
+      command: "{{ hostvars[groups['master'][0]]['kubeadm_join_cmd'] }}"
+      register: join_result
+    
+    - name: Verify node joined successfully
+      command: kubectl get nodes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      delegate_to: "{{ groups['master'][0] }}"
+      register: nodes_output
+      changed_when: false
+    
+    - name: Display cluster nodes
       debug:
-        var: hostvars['master']
-
-    - name: Join Kubernetes cluster
-      command: "{{ hostvars['master']['kubeadm_join_cmd'] }}"
+        msg: "{{ nodes_output.stdout_lines }}"
