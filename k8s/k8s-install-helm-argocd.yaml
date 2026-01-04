@@ -1,0 +1,224 @@
+---
+- name: Install Helm manually on control-plane
+  hosts: controlplane
+  become: true
+  vars:
+    helm_version: "v3.14.4"   # adjust as desired
+    helm_arch: "linux-amd64"
+    helm_tmp_dir: "/tmp/helm-install"
+  tasks:
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name:
+          - curl
+          - ca-certificates
+          - tar
+          - gzip
+          - coreutils
+        state: present
+        update_cache: true
+
+    - name: Create temp dir
+      ansible.builtin.file:
+        path: "{{ helm_tmp_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download Helm tarball
+      ansible.builtin.get_url:
+        url: "https://get.helm.sh/helm-{{ helm_version }}-{{ helm_arch }}.tar.gz"
+        dest: "{{ helm_tmp_dir }}/helm-{{ helm_version }}-{{ helm_arch }}.tar.gz"
+        mode: "0644"
+
+    - name: Download Helm sha256
+      ansible.builtin.get_url:
+        url: "https://get.helm.sh/helm-{{ helm_version }}-{{ helm_arch }}.tar.gz.sha256sum"
+        dest: "{{ helm_tmp_dir }}/helm-{{ helm_version }}-{{ helm_arch }}.tar.gz.sha256sum"
+        mode: "0644"
+
+    - name: Verify Helm tarball checksum
+      ansible.builtin.shell: |
+        set -euo pipefail
+        cd "{{ helm_tmp_dir }}"
+        sha256sum -c "helm-{{ helm_version }}-{{ helm_arch }}.tar.gz.sha256sum"
+      args:
+        executable: /bin/bash
+
+    - name: Extract Helm
+      ansible.builtin.unarchive:
+        src: "{{ helm_tmp_dir }}/helm-{{ helm_version }}-{{ helm_arch }}.tar.gz"
+        dest: "{{ helm_tmp_dir }}"
+        remote_src: true
+
+    - name: Install helm binary into /usr/local/bin
+      ansible.builtin.copy:
+        src: "{{ helm_tmp_dir }}/{{ helm_arch }}/helm"
+        dest: "/usr/local/bin/helm"
+        remote_src: true
+        mode: "0755"
+
+    - name: Check helm version
+      ansible.builtin.command: helm version
+      register: helm_ver
+      changed_when: false
+
+    - name: Show helm version
+      ansible.builtin.debug:
+        var: helm_ver.stdout
+
+- name: Ensure workers have flannel CNI binary in kubelet expected path
+  hosts: workers
+  become: true
+  tasks:
+    - name: Ensure /usr/lib/cni exists
+      ansible.builtin.file:
+        path: /usr/lib/cni
+        state: directory
+        mode: "0755"
+
+    - name: Ensure flannel CNI binary exists at /opt/cni/bin/flannel
+      ansible.builtin.stat:
+        path: /opt/cni/bin/flannel
+      register: flannel_bin
+
+    - name: Fail if flannel binary missing on worker
+      ansible.builtin.fail:
+        msg: "Expected /opt/cni/bin/flannel to exist on worker, but it does not."
+      when: not flannel_bin.stat.exists
+
+    - name: Symlink flannel into /usr/lib/cni/flannel (kubelet lookup path)
+      ansible.builtin.file:
+        src: /opt/cni/bin/flannel
+        dest: /usr/lib/cni/flannel
+        state: link
+        force: true
+
+    - name: Restart containerd and kubelet
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - containerd
+        - kubelet
+
+- name: Install/verify Flannel, install Argo CD with Helm, expose to LAN via NodePort
+  hosts: controlplane
+  become: true
+  vars:
+    argocd_namespace: "argocd"
+    argocd_release: "argocd"
+    # Your values file already exists on the controlplane in your session; adjust path if needed
+    argocd_values_file: "/home/debian/values.yaml"
+    # NodePort to expose Argo CD HTTPS on LAN
+    argocd_nodeport_https: 32080
+  tasks:
+    - name: Ensure argocd namespace exists
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl get ns "{{ argocd_namespace }}" >/dev/null 2>&1 || kubectl create ns "{{ argocd_namespace }}"
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Label all non-control-plane nodes as nodepool=workers (best-effort)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for n in $(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+          roles=$(kubectl get node "$n" -o jsonpath='{.metadata.labels.node-role\.kubernetes\.io/control-plane}')
+          if [ -z "$roles" ]; then
+            kubectl label node "$n" nodepool=workers --overwrite
+          fi
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Add argo helm repo and update
+      ansible.builtin.shell: |
+        set -euo pipefail
+        helm repo add argo https://argoproj.github.io/argo-helm || true
+        helm repo update
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Ensure Flannel is installed (apply upstream manifest if missing)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl get ns kube-flannel >/dev/null 2>&1 || \
+          kubectl apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Wait for flannel daemonset pods to be ready (kube-flannel namespace)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl -n kube-flannel rollout status ds/kube-flannel-ds --timeout=5m
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Install/upgrade Argo CD (values.yaml must exist)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        test -f "{{ argocd_values_file }}"
+        helm upgrade --install "{{ argocd_release }}" argo/argo-cd \
+          -n "{{ argocd_namespace }}" \
+          -f "{{ argocd_values_file }}" \
+          --timeout 20m
+      args:
+        executable: /bin/bash
+
+    - name: Wait for Argo CD deployments/statefulset to be ready (best-effort)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        kubectl -n "{{ argocd_namespace }}" rollout status deploy/argocd-server --timeout=10m
+        kubectl -n "{{ argocd_namespace }}" rollout status deploy/argocd-repo-server --timeout=10m
+        kubectl -n "{{ argocd_namespace }}" rollout status deploy/argocd-applicationset-controller --timeout=10m || true
+        kubectl -n "{{ argocd_namespace }}" rollout status deploy/argocd-dex-server --timeout=10m || true
+        kubectl -n "{{ argocd_namespace }}" rollout status deploy/argocd-redis --timeout=10m || true
+        kubectl -n "{{ argocd_namespace }}" rollout status deploy/argocd-notifications-controller --timeout=10m || true
+        kubectl -n "{{ argocd_namespace }}" rollout status statefulset/argocd-application-controller --timeout=10m
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Expose Argo CD server service to LAN via NodePort on {{ argocd_nodeport_https }}
+      ansible.builtin.shell: |
+        set -euo pipefail
+        # Patch service to NodePort and set stable nodePort for HTTPS
+        kubectl -n "{{ argocd_namespace }}" patch svc argocd-server --type merge -p '{
+          "spec": {
+            "type": "NodePort",
+            "ports": [
+              {
+                "name": "https",
+                "port": 443,
+                "protocol": "TCP",
+                "targetPort": 8080,
+                "nodePort": {{ argocd_nodeport_https }}
+              }
+            ]
+          }
+        }'
+      args:
+        executable: /bin/bash
+
+    - name: Print how to access Argo CD from LAN + get initial password
+      ansible.builtin.shell: |
+        set -euo pipefail
+        echo "Argo CD is exposed on NodePort {{ argocd_nodeport_https }} (HTTPS)."
+        echo "Try: https://<ANY_NODE_IP>:{{ argocd_nodeport_https }}"
+        echo
+        echo "Initial admin password:"
+        kubectl -n "{{ argocd_namespace }}" get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+        echo
+      args:
+        executable: /bin/bash
+      register: access_info
+      changed_when: false
+
+    - name: Show access info
+      ansible.builtin.debug:
+        var: access_info.stdout
