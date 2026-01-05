@@ -1,0 +1,140 @@
+
+---
+# Debian 13 Trixie
+- name: Gitlab worker docker container setup
+  hosts: gitlab
+  become: true
+  tasks:
+    
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+      tags: ['setup']
+    
+    - name: Install required dependencies
+      ansible.builtin.apt:
+        name:
+          - curl
+          - gnupg
+          - apt-transport-https
+          - ca-certificates
+          - wget
+        state: present
+      tags: ['setup']
+    
+    - name: Create keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+      tags: ['setup']
+    
+    - name: Download and install HashiCorp GPG key
+      ansible.builtin.shell:
+        cmd: curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o /etc/apt/keyrings/hashicorp-archive-keyring.gpg
+        creates: /etc/apt/keyrings/hashicorp-archive-keyring.gpg
+      tags: ['setup']
+    
+    - name: Add HashiCorp repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/hashicorp-archive-keyring.gpg arch=amd64] https://apt.releases.hashicorp.com trixie main"
+        state: present
+        filename: hashicorp
+      tags: ['setup']
+    
+    - name: Update apt cache after adding repository
+      ansible.builtin.apt:
+        update_cache: true
+      tags: ['setup']
+    
+    - name: Install HashiCorp Vault
+      ansible.builtin.apt:
+        name: vault
+        state: present
+      tags: ['setup', 'vault']
+    
+    - name: Install Python pip
+      ansible.builtin.apt:
+        name: python3-pip
+        state: present
+      tags: ['setup', 'vault']
+    
+    - name: Install hvac Python library for Vault integration
+      ansible.builtin.pip:
+        name: hvac>=1.2.1
+        state: present
+        break_system_packages: true
+      tags: ['setup', 'vault']
+
+    - name: Install docker Python library for Vault integration
+      ansible.builtin.pip:
+        name: docker>=6.0.0
+        state: present
+        break_system_packages: true
+      tags: ['setup', 'docker']
+  
+    - name: Verify Docker is installed
+      ansible.builtin.command: docker --version
+      register: docker_check
+      changed_when: false
+      failed_when: docker_check.rc != 0
+      tags: ['docker']
+
+    - name: Ensure destination directory exists
+      ansible.builtin.file:
+        path: /opt/railway-gitlab-worker-image
+        state: directory
+        mode: '0755'
+      tags: ['deploy']
+    
+    - name: Pull private repository using personal access token
+      ansible.builtin.git:
+        repo: 'https://{{ github_token }}@github.com/DDSNA/railway-gitlab-worker-image.git'
+        dest: /opt/railway-gitlab-worker-image 
+        version: main
+        force: true
+      environment:
+        GIT_TERMINAL_PROMPT: '0'
+      no_log: true
+      tags: ['deploy']
+    
+    - name: Retrieve secrets from HashiCorp Vault
+      block:
+        - name: Get secrets from Vault KV store
+          community.hashi_vault.vault_kv2_get:
+            url: "{{ vault_url }}"
+            auth_method: userpass
+            username: "{{ vault_user }}"
+            password: "{{ vault_password }}"
+            path: "{{ vault_secret_path }}"
+            engine_mount_point: "kv2"
+          register: vault_secrets
+      rescue:
+        - name: Log Vault connection failure
+          ansible.builtin.debug:
+            msg: "Failed to retrieve secrets from Vault: {{ ansible_failed_result.msg }}"
+      tags: ['vault']
+
+    - name: Use the retrieved secrets
+      ansible.builtin.debug:
+        msg: 
+          - "The CI Server URL is: {{ vault_secrets.secret.CI_SERVER_URL }}"
+          - "The Runner Token is: {{ vault_secrets.secret.RUNNER_TOKEN }}"
+
+    - name: Build Docker image with Buildx
+      community.docker.docker_image_build:
+        name: railway-gitlab-worker-image:latest
+        path: /opt/railway-gitlab-worker-image
+        args:
+          CI_SERVER_URL: "{{ vault_secrets.secret.CI_SERVER_URL }}"
+          RUNNER_TOKEN: "{{ vault_secrets.secret.RUNNER_TOKEN }}"
+          BUILDKIT_INLINE_CACHE: "1"
+        cache_from:
+          - type=registry,ref=railway-gitlab-worker-image:latest
+        outputs:
+          - type: image
+            name: railway-gitlab-worker-image:latest
+      environment:
+        DOCKER_BUILDKIT: "1"
+      tags: ['docker', 'deploy']
