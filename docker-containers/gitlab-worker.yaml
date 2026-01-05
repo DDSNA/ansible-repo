@@ -129,9 +129,6 @@
         args:
           CI_SERVER_URL: "{{ vault_secrets.secret.CI_SERVER_URL }}"
           RUNNER_TOKEN: "{{ vault_secrets.secret.RUNNER_TOKEN }}"
-          BUILDKIT_INLINE_CACHE: "1"
-        cache_from:
-          - type=registry,ref=railway-gitlab-worker-image:latest
         outputs:
           - type: image
             name: railway-gitlab-worker-image:latest
