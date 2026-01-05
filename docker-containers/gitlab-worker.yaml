@@ -108,7 +108,7 @@
             username: "{{ vault_user }}"
             password: "{{ vault_password }}"
             path: "{{ vault_secret_path }}"
-            engine_mount_point: "kv2"
+            engine_mount_point: "gitlab_kv"
           register: vault_secrets
       rescue:
         - name: Log Vault connection failure
@@ -120,7 +120,7 @@
       ansible.builtin.debug:
         msg: 
           - "The CI Server URL is: {{ vault_secrets.secret.CI_SERVER_URL }}"
-          - "The Runner Token is: {{ vault_secrets.secret.RUNNER_TOKEN }}"
+          - "The Runner Token is: {{ vault_secrets.secret.RUNNER_TOKEN_LOCAL }}"
 
     - name: Build Docker image with Buildx
       community.docker.docker_image_build:
