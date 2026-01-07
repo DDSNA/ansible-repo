@@ -127,7 +127,6 @@
         name: railway-gitlab-worker-image:latest
         path: /opt/railway-gitlab-worker-image
         rebuild: always
-        nocache: true
         args:
           CI_SERVER_URL: "{{ vault_secrets.secret.CI_SERVER_URL }}"
           RUNNER_TOKEN: "{{ vault_secrets.secret.RUNNER_TOKEN_LOCAL }}"
