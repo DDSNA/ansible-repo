@@ -1,5 +1,5 @@
 - name: Install Docker on all nodes
-  hosts: kube_node
+  hosts: kube_node, media_server
   become: true
   tasks:
     
