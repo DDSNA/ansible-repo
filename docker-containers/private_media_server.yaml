@@ -1,0 +1,45 @@
+# requirements: docker
+# setup: jellyfin, ftp client containers
+
+- name: Ensure Docker is installed on Private Media Server and jellyfin host
+  hosts: media_server
+  become: true
+
+  tasks:
+    - name: Check for Docker installation
+      ansible.builtin.shell: |
+        if command -v docker &> /dev/null
+        then
+            echo "installed"
+        else
+            echo "not installed"
+        fi
+      register: docker_check
+      changed_when: false
+
+    - name: Ensure Docker is installed
+      ansible.builtin.import_playbook: ../k8s/k8s-ensure-docker.yaml
+      when: docker_check.stdout == "not installed"
+
+- name: Configure docker-compose.yaml, using nginx as a proxy for jellyfin
+  hosts: media_server
+  become: true
+  tasks:
+    - name: Pull docker images
+      block:
+        - name: Attempt jellyfin image pull
+          community.docker.docker_image_pull:
+            name: jellyfin/jellyfin:unstable
+            pull: always
+        - name: Attempt nginx image pull
+          community.docker.docker_image_pull:
+            name: nginx
+        - name: Attempt sftp image pull
+          community.docker.docker_image_pull:
+            name: atmoz/sftp:alpine
+      rescue:
+        - name: Notify team of failure
+          ansible.builtin.debug:
+            msg: "Deployment failed on {{ inventory_hostname }}. Rolling back."
+        
+        
